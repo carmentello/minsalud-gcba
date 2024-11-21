@@ -1,0 +1,502 @@
+---
+title: "Exploración del problema de ausentismo"
+author: "Carmen Tello"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+#install.packages("tidyverse")
+#install.packages("sf")
+#install.packages("readxl")
+#install.packages("eph")
+#install.packages("knitr")
+```
+
+
+
+```{r Librerías, message=FALSE, warning=FALSE, include=FALSE}
+# Cargo las librerías con las que voy a trabajar
+library(tidyverse)
+library(sf)
+library(readxl)
+library(eph)
+library(knitr)
+library(tidytext)
+options(scipen=99)
+```
+
+### Introducción
+
+Para el ejercicio, además de trabajar con las bases provistas, voy a incorporar dos bases externas.Por un lado, un shapefile de las comunas de la Ciudad Autónoma de Buenos Aires para generar mapas. Por otro lado, también trabajaré con información del censo 2022, para conocer la población total de la Ciudad según edad, género y comuna. Esto me va a permitir tener un análisis más preciso de la distribución demográfica de los pacientes. La base del censo se ve así:
+
+```{r Bases, echo=FALSE, message=FALSE, warning=FALSE}
+ap_muestra <- read.csv("datasets/ap_muestra.csv", sep=";", encoding = "UTF-8")
+efectores_muestra <- read.csv("datasets/efectores_muestra.csv", sep=";", encoding = "UTF-8")
+pacientes_muestra <- read.csv("datasets/pacientes_muestra.csv", sep=";", encoding = "UTF-8")
+turnos_muestra <- read.csv("datasets/turnos_muestra.csv", sep=";", encoding = "UTF-8")
+geo <- read_sf("datasets/departamentos/departamento.shp") %>% filter(gna == "Comuna") %>% 
+  mutate(nam = tolower(nam))
+
+censo_c <- list()
+for(i in 4:18){
+name <- paste("comuna_",(as.numeric(i)-3),sep="")  
+censo_c[[name]] <- data.frame()
+
+censo_c[[name]] <- read_xlsx("datasets/censo_2022.xlsx", sheet = i, skip = 4) %>% 
+  rename(edad_agrupada = 1,
+         total = 2,
+         `F` = 3,
+         M = 4) %>% select(edad_agrupada:M)
+}
+
+censo <- data.frame()
+censo <- bind_rows(
+  lapply(names(censo_c), function(name) {
+    df <- censo_c[[name]]
+    df$comuna <- name
+    df
+  })
+) %>% mutate(
+  comuna = sub("_"," ",comuna)) %>% 
+  filter(grepl("\\-|y",edad_agrupada)==T)
+
+censo <- censo %>% filter(is.na(total)==0) %>% select(-total) %>% 
+  pivot_longer(c("M","F"),names_to = "genero",values_to="poblacion")
+
+rm(censo_c)
+
+head(censo) %>% kable()
+```
+
+### Limpieza de los datos
+
+#### Duplicados
+
+Voy a comenzar con un breve chequeo para identificar IDs o registros repetidos. 
+Veo que Turnos tiene IDs duplicados. Sin embargo, el ID de esa base no es único sino que requiere de la combinación con los ID de efector y de paciente: corroboro que no hay registros duplicados. Ahora puedo joinear las bases para trabajar con un dataframe único que contenga toda la información.
+
+```{r Registros únicos, message=FALSE, warning=FALSE, include=FALSE}
+
+id_duplicados <- data.frame(
+Base = c("Pacientes tiene registros duplicados" ,"Efectores tiene registros duplicados", 
+         "AP tiene registros duplicados", "Turnos tiene registros duplicados"),
+Valor = c(n_distinct(pacientes_muestra$id_paciente) == nrow(pacientes_muestra), 
+        n_distinct(efectores_muestra$id_efector) == nrow(efectores_muestra),
+        n_distinct(ap_muestra$id_area_programatica) == nrow(ap_muestra),
+        n_distinct(turnos_muestra$id_turno) == nrow(turnos_muestra))) %>% 
+  filter(Valor == FALSE) %>% pull(Base) %>% c() %>% paste(collapse=", ")
+
+turnos_dup <- turnos_muestra %>% 
+  group_by(id_turno,id_efector,id_paciente) %>% mutate(n=n()) %>% ungroup() %>% filter(n > 1) %>% length()
+
+df <- turnos_muestra %>% 
+  left_join(pacientes_muestra,by="id_paciente") %>% 
+  left_join(efectores_muestra,by="id_efector") %>% 
+  left_join(ap_muestra,by="id_area_programatica",suffix=c("_ef","_ap"))
+```
+
+Al chequear la base completa, hay 27 valores vacíos: pertenecen a `fecha_nacimiento`. Para no perder casos de turnos los voy a mantener dentro del dataset, pero no los usaré para el análisis demográfico.
+
+```{r Valores vacíos, message=FALSE, warning=FALSE, include=FALSE}
+any(is.na(df))
+valores_vacios <- sum(is.na(df))
+col_vacias <- data.frame(sapply(df,function(x) sum(is.na(x)))) %>% 
+  rename(vacios = 1) %>% filter(vacios > 0) %>%  rownames() %>% paste(collapse=", ")
+```
+
+```{r Clases, message=FALSE, warning=FALSE, include=FALSE}
+#Identifico las clases de las variables, y las transformo para facilitar el procesamiento:
+#IDs a tipo character para evitar confusiones, fechas a date.
+
+sapply(df,class)
+df <- df %>% 
+  mutate_at(.vars=c(vars(contains("id_"))),as.character) %>% 
+  mutate_at(.vars=c(vars(contains("fecha_"))),as.Date)
+```
+
+#### Construcción de variable edad
+
+Construyo la variable de edad al momento del turno asignado. 
+Además, voy a crear una edad agrupada en quintiles. A medida que la edad crece, la cantidad de turnos asignados disminuyen. Veo algunos valores atípicos, mayores a los 100 años. Por el momento tomaré el agrupamiento que propone el Indec en quintiles y mayores de 100 años.
+
+```{r Variable de edad, echo=FALSE, message=FALSE, warning=FALSE}
+
+df <- df %>% 
+  mutate(edad = trunc((fecha_nacimiento %--% fecha_turno) / years(1)))
+
+df$edad_agrupada <- cut(df$edad,
+                        breaks = seq(0,ceiling(max(df$edad,na.rm=T)/5)*5,by=5),right=F,include_lowest = F) 
+df <- df %>% 
+  separate(edad_agrupada,c("edad_min","edad_max"),sep=",") %>% 
+  mutate(edad_min = as.integer(sub("\\[","",edad_min)),
+         edad_max = as.integer(sub("\\)","",edad_max))-1,
+         edad_agrupada = ifelse(edad > 99, "100 y más", paste(edad_min,"-",edad_max,sep=""))
+         ) %>% select(-c(edad_min,edad_max))
+
+df$edad_agrupada <- reorder(df$edad_agrupada,df$edad)
+
+df %>% ggplot() + geom_histogram(aes(edad),fill = "tomato3")+
+  labs(title = "Distribución la cantidad de turnos asignados según la edad del paciente",
+       x = "Edad",
+       y = "Turnos") +
+  theme_minimal()
+```
+
+### Descripción de la población de personas que han sacado un turno en el período 06/2016 - 12/2018
+
+#### Cantidad de turnos tomados por persona
+
+Antes de comenzar con el análisis demográfico, me interesa conocer de forma exploratoria la frecuencia de la cantidad de turnos que toma cada persona. La mitad de los turnos son de primera consulta. Una línea de investigación para explicar el ausentismo podría ser desagregándolo según si el turno es de primera vez o si es recurrente. 
+
+```{r Cant turnos, echo=FALSE, message=FALSE, warning=FALSE}
+
+df %>% 
+  group_by(id_paciente) %>% 
+  summarise(n=n()) %>% pull(n) %>% table() %>% 
+  prop.table() %>% data.frame() %>% 
+  rename(`Cantidad de turnos`=1,
+         `Frecuencia` = 2) %>% 
+  mutate(`Cantidad de turnos` = ifelse(as.integer(`Cantidad de turnos`) < 6,
+                                       as.character(`Cantidad de turnos`),
+                                       "Más de 5")) %>% 
+  group_by(`Cantidad de turnos`) %>% 
+  summarise(Frecuencia = paste(round(sum(Frecuencia,na.rm=T)*100,1),"%",sep="")) %>% 
+  kable()
+
+```
+
+#### Pirámide poblacional
+
+El siguiente gráfico muestra qué porcentaje de la población total de CABA toma turnos en los centros de salud, según edad y género. Comparo con los datos censales de 2022 para no dar mayor relevancia en el análisis a segmentos que puedan estar sobre o sub poblados.
+A partir de la pirámide, se puede ver que la población está principalmente concentrada en pacientes que tienen entre 0 y 4 años. Además, la distribución por género es más equitativa entre los pacientes de 0 a 14 años, luego la población se feminiza. Sería interesante, para el caso de los menores de edad, conocer el género de la persona a cargo: una hipótesis puede ser que esta población también está feminizada, ya que las mujeres tienden a realizar más consultas por motivos de salud que los varones. También sería interesante conocer la tasa de ausentismo según el género, para analizar si además de asistir en menor medida, los varones tienden a ausentarse más.
+
+* Aclaración: debido a que la muestra de turnos pertenece a un período de dos años, una persona que realizó más de un turno puede haber pasado de un grupo etario al siguiente. Para no perder precisión a la hora de analizar los datos, en lugar de trabajar con la edad al día de la fecha decidí trabajar con la edad al día del turno. Esto se debe a que al haber pasado 6 años desde el último turno del dataset pierdo información valiosa del primer grupo etario (0-4 años) y tiendo a envejecer a la población. Una solución podría haber sido tomar la edad más joven de la persona.
+
+```{r Pirámide poblacional, echo=FALSE, message=FALSE, warning=FALSE}
+
+df %>% filter(is.na(edad)==F) %>% 
+  group_by(edad_agrupada,genero) %>% 
+  summarise(poblacion = n_distinct(id_paciente)) %>% 
+  left_join(censo %>% group_by(edad_agrupada,genero) %>% 
+              summarise(poblacion_censo = sum(poblacion,na.rm=T))) %>% 
+  mutate(porc = poblacion/poblacion_censo) %>% 
+  mutate(porc = ifelse(genero == "M", porc*(-1),
+                            porc),
+         poblacion = ifelse(genero == "M", poblacion*(-1),
+                            poblacion),
+         poblacion_censo = ifelse(genero == "M", poblacion_censo*(-1),
+                            poblacion_censo),
+         edad_agrupada = factor(edad_agrupada,levels(df$edad_agrupada))) %>% 
+  ggplot() +
+  geom_bar(aes(edad_agrupada,poblacion_censo),fill="lightgrey",stat="identity") +
+  geom_bar(aes(edad_agrupada,poblacion,fill=genero),stat="identity") +
+  geom_text(aes(x=edad_agrupada,y=ifelse(poblacion<0,poblacion-10000,poblacion+10000),
+                label=paste(round(ifelse(porc<0,porc*(-1),porc),3)*100,"%",sep="")),
+            size=3) +
+  coord_flip()+
+  labs(title = "Porcentaje de la población de CABA que toma turnos en \n centros de salud, según edad y género",
+       x = "Edad agrupada",
+       y = "Población",
+       fill = "Género",
+       subtitle = "En gris, la población censal por grupo") +
+  theme_minimal()
+```
+
+#### Mapa de turnos por comuna
+
+En este gráfico se puede ver el porcentaje de la población de cada comuna que pide turnos en centros de salud.
+Las comunas con porcentajes más altos son: 8, 4, 9, 1 y 7. En términos generales, se podría decir que la población que reside debajo de Av. Rivadavia tiende a utilizar el sistema público de salud en mayor medida.
+
+```{r Mapa, echo=FALSE, message=FALSE, warning=FALSE}
+df$departamento <- reorder(df$departamento,as.numeric(sub("comuna ","",df$departamento)))
+
+geo %>% select(nam,geometry) %>% left_join(
+df %>% 
+  group_by(departamento) %>% 
+  summarise(poblacion = n_distinct(id_paciente),.groups = "drop") %>% 
+  arrange(departamento)%>% 
+  left_join(censo %>% 
+              group_by(comuna) %>% 
+              summarise(poblacion_censo = sum(poblacion,na.rm=T)),by=c("departamento"="comuna")),
+  by=c("nam"="departamento")) %>% 
+  mutate(nam = factor(nam,levels=levels(df$departamento)),
+         porc = poblacion/poblacion_censo) %>% 
+  ggplot() +
+  geom_sf(aes(fill=porc*100),color="white") +
+  geom_sf_label(aes(label = paste(sub("comuna ","C",nam),"\n",round(porc*100,1),"%",sep="")),size=3,alpha=0.5)+
+  labs(title = "Porcentaje de la población de CABA que toma turnos en \n centros de salud, según comuna",
+       fill = "Porcentaje de población") +
+  scale_fill_viridis_c() +
+  theme_void()
+```
+
+### Descripción del fenómeno de ausentismo
+
+#### Ausentismo global
+
+Para trabajar con el ausentismo, tomaremos los turnos otorgados hasta el 31 de diciembre de 2018, ya que todos los que tienen lugar en el 2019 figuran como ausentes.
+
+En el período consultado se otorgaron 295.124 turnos, de los cuales 59.116 tuvieron ausentismo. Esto representa un 20% de los turnos.  
+
+```{r Ausentismo, message=FALSE, warning=FALSE, include=FALSE}
+df_clean <- df %>% filter(fecha_turno <= as.Date("2018-12-31")) 
+
+turnos <- nrow(df_clean)
+ausentes <- nrow(df_clean[df_clean$presente_al_turno=="No",])
+porc_ausentes <- paste(round(ausentes/turnos,3)*100,"%",sep="")
+data.frame(table(df_clean$presente_al_turno)) %>% rename(Presente = 1, Cant = 2) %>% kable(caption = "Presente al turno")
+```
+
+#### Turnos otorgados en el tiempo
+
+La cantidad de turnos otorgados creció sustancialmente entre 2016 y 2018. Cabe la pregunta de a qué se debe: si está relacionado con un aumento de la necesidad de utilizar el sistema público (por crecimiento de la pobreza, disminución del empleo registrado, etcétera), si se vincula con una ampliación de la red del sistema público de salud, o responde a algún otro factor.
+
+```{r Turnos en tiempo, echo=FALSE, message=FALSE, warning=FALSE}
+df_clean %>% 
+  mutate(año_mes = as.Date(paste(format(fecha_turno,"%Y-%m"),"-01",sep=""))) %>% 
+  group_by(año_mes) %>% 
+  summarise(n = n()) %>% 
+  ggplot(aes(x=año_mes,y=n))+
+  geom_path()+
+  labs(title = "Cantidad de turnos otorgados en centros de salud entre 2016 y 2018, \n en CABA",
+       x="",
+       y = "Turnos")+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  scale_x_date(date_labels = "%Y-%m", date_breaks = "1 month") 
+
+```
+
+#### Tasa de ausentismo en el tiempo
+
+Sin embargo, la tasa de ausentismo fue disminuyendo en el tiempo.
+
+```{r Ausentismo tiempo, echo=FALSE, message=FALSE, warning=FALSE}
+
+df_clean %>% 
+  mutate(año_mes = format(fecha_turno,"%Y-%m")) %>% 
+  group_by(año_mes,presente_al_turno) %>% 
+  summarise(n = n(),.groups = "drop") %>%
+  group_by(año_mes) %>% 
+  mutate(porc = n/sum(n,na.rm=T),
+         presente_al_turno = factor(presente_al_turno,levels=c("Si","No"))
+         ) %>% 
+  arrange(año_mes,presente_al_turno) %>% 
+ggplot() +
+  geom_bar(aes(año_mes,porc,fill=presente_al_turno),stat="identity",position = "fill") +
+  geom_text(aes(x=año_mes,y=porc,fill=presente_al_turno,
+                label=paste(round(porc,3)*100,"%",sep="")),
+            size=2.5, angle = 90,stat="identity",position = "fill",vjust=0) +
+  labs(title = "Tasa de ausentismo por mes en centros de salud",
+       x="", y = "",fill = "Presente al turno")+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) 
+  
+```
+
+#### Turnos por efector.
+
+A continuación, la lista de los turnos otorgados por efector y su tasa de ausentismo:
+Noto algunos casos atípicos como el CESAC N°20, que tiene 37 turnos otorgados con más de un 90% de ausentismo, o el CESAC N°27 que teniendo 15.996 turnos otorgados tiene una tasa de apenas 0.9%.
+
+```{r Ausentismo efectores, echo=FALSE, message=FALSE, warning=FALSE}
+df_clean %>% 
+  rename(Efector = descripcion_ef) %>% 
+  group_by(Efector,presente_al_turno) %>% 
+  summarise(`Turnos otorgados`=n(),.groups = "drop") %>% 
+  pivot_wider(names_from=presente_al_turno,values_from=`Turnos otorgados`) %>% mutate(Total = na.omit(Si)+na.omit(No),
+                       Ausentismo = paste(round(No/Total,3)*100,"%",sep="")) %>% 
+  arrange(desc(`Total`)) %>% select(-c(Si,No)) %>% 
+  kable(caption = "Cantidad de turnos otorgados por efector")
+```
+
+### Describir potenciales condicionantes del ausentismo por tipo de turno
+
+#### Porcentaje de ausentismo por tipo de turno (programados vs no programados)
+
+Del total de turnos asignados (295.124), 140.002 corresponden a turnos espontáneos mientras que 155.122 son de turnos programados.
+El 11,7% de los turnos espontáneos son ausentes, mientras que los turnos programados tienen una tasa del 27,5%.
+
+```{r Ausentismo según tipo, echo=FALSE, message=FALSE, warning=FALSE}
+df_clean <- df_clean %>% 
+  mutate(tipo_turno = ifelse(fecha_turno-fecha_que_se_otorgo>=days(1),"Programado","Espontáneo"))
+
+espontaneos <- nrow(df_clean[df_clean$tipo_turno == "Espontáneo",])
+programado <- nrow(df_clean[df_clean$tipo_turno == "Programado",])
+
+df_clean %>% 
+  calculate_tabulates(x="tipo_turno",
+                      y="presente_al_turno",
+                      add.percentage = "row",add.totals="row",affix_sign =T) %>% 
+  rename(`Tipo de turno / Presente al turno` = 1) %>% 
+  kable(caption = "Ausentismo según tipo de turno")
+```
+
+#### Porcentaje de ausentismo por tipo de turno en el tiempo
+
+Mientras que en el caso de los turnos espontáneos la tasa de ausentismo se mantiene estable, para los turnos programados disminuyó casi a la mitad.
+
+```{r Ausentismo, tipo, tiempo, echo=FALSE, message=FALSE, warning=FALSE}
+df_clean %>% 
+  mutate(año_mes = format(fecha_turno,"%Y-%m")) %>% 
+  group_by(año_mes,presente_al_turno,tipo_turno) %>% 
+  summarise(n = n(),.groups = "drop") %>%  
+  group_by(año_mes,tipo_turno) %>% 
+  mutate(porc = n/sum(n,na.rm=T),
+         presente_al_turno = factor(presente_al_turno,levels=c("Si","No"))
+         ) %>% 
+  arrange(año_mes,presente_al_turno) %>% 
+ggplot() +
+  geom_bar(aes(año_mes,porc,fill=presente_al_turno),stat="identity",position = "fill") +
+  geom_text(aes(x=año_mes,y=porc,fill=presente_al_turno,
+                label=paste(round(porc,3)*100,"%",sep="")),
+            size=2.5, angle = 90,stat="identity",position = "fill",vjust=0) +
+  labs(title = "Tasa de ausentismo por mes según tipo de turno",
+       fill = "Presente al turno", y = "",
+       x = "")+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  facet_wrap(vars(tipo_turno),ncol=1)
+```
+
+#### Porcentaje de ausentismo de turnos PROGRAMADOS por efector
+
+En este gráfico tenemos un cuadrante por cada efector, con una línea de tiempo de la tasa de ausentismo. La línea varía su color en base al nivel de ausentismo (Alto cuando supera el 75%, Medio cuando supera el 25%, y Bajo cuando está por debajo del 25%. Estos valores fueron asignados de forma arbitraria, para ser estadísticamente descriptivos requieren de mayor análisis.) Se ve que algunos efectores tienen mayor estabilidad, mientras que otros tienen mucha varianza en la tasa de ausentismo. Es necesario prestar mayor atención a efectores como el Cesac 20 o el 41, que tienen tasas muy altas.
+
+```{r Ausentismo por efector, echo=FALSE, message=FALSE, warning=FALSE}
+df_clean %>% 
+  mutate(año_mes = as.Date(paste(format(fecha_turno,"%Y-%m"),"-01",sep=""))) %>% 
+  filter(tipo_turno == "Programado") %>% 
+  group_by(año_mes,presente_al_turno,abreviatura_ef) %>% 
+  summarise(n=n(),.groups = "drop") %>% group_by(año_mes,abreviatura_ef) %>% 
+  mutate(porc = n/sum(n),
+         color = ifelse(porc <= 0.25,"Bajo",ifelse((porc <= 0.75 & porc > 0.25), "Medio", "Alto"))) %>% arrange(año_mes,abreviatura_ef,presente_al_turno) %>% 
+  filter(presente_al_turno == "No") %>% 
+  ggplot()+
+  geom_path(aes(x=año_mes,y=porc,color=color,group=1),
+            )+
+  scale_color_manual(values = c('Bajo' = 'darkgreen', 'Medio'='yellow', 'Alto' = 'darkred')) +
+  labs(title = "Porcentaje de ausentismo en el tiempo por efector", y = "", x = "", color = "Nivel")+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  facet_wrap(~abreviatura_ef)+
+  theme_minimal()
+```
+
+#### Porcentaje de ausentimo por área programática a la que pertenecen los efectores
+
+Al analizar las áreas programáticas involucradas con el efector, se ve que el Hospital Argerich y el Vélez Sarsfield cuentan con las tasas más altas de ausentismo.
+
+```{r Ausentismo AP, echo=FALSE, message=FALSE, warning=FALSE}
+ausentismo_ap <- df_clean %>% 
+  group_by(abreviatura_ap,presente_al_turno) %>% 
+  summarise(n = n(),.groups = "drop") %>%  
+  group_by(abreviatura_ap) %>% 
+  mutate(porc = n/sum(n,na.rm=T),
+         presente_al_turno = factor(presente_al_turno,levels=c("Si","No"))
+         ) %>% ungroup() %>% 
+  mutate(order = ifelse(presente_al_turno == 'No', porc, 0)) %>%
+  ungroup() %>%
+  mutate(abreviatura_ap = reorder(abreviatura_ap, order))
+
+ggplot(ausentismo_ap) +
+  geom_bar(aes(abreviatura_ap,porc,fill=presente_al_turno),stat="identity",position = "fill") +
+  geom_text(aes(x=abreviatura_ap,y=porc,
+                label=paste(round(porc,3)*100,"%",sep="")),
+            size=3, #angle = 90,
+            stat="identity",position = "fill",vjust=0) +
+  labs(title = "Tasa de ausentismo en turnos de centros de salud \n de CABA, según área programática",
+       x = "Área programática",y="",fill = "Presente al turno")+
+  coord_flip() +
+  theme_minimal()
+```
+
+#### Distribución de tiempo-al-turno programado para turnos ausentes vs presentes
+
+En primer lugar, limpio los 3 valores que quedaron en negativo, asumiendo que se trata de un error de registro.
+Al analizar el gráfico, se ve claramente que los turnos asignados para el mismo día o el día siguiente tienen una tasa de asistencia muy alta. A mayor diferencia de días, más ausentismo: la relación llega a invertirse.
+
+```{r Tiempo al turno, echo=FALSE, message=FALSE, warning=FALSE}
+df_clean %>% 
+  mutate(tiempo_al_turno = as.integer(fecha_turno-fecha_que_se_otorgo),
+         presente_al_turno = factor(presente_al_turno,levels=c("Si","No"))) %>% 
+  filter(tiempo_al_turno >= 0) %>% 
+  ggplot()+
+  geom_density(aes(tiempo_al_turno,fill=presente_al_turno),alpha = 0.5)+
+  scale_x_continuous(limits = c(0, 100)) +
+  labs(title = "Distribución de la diferencia de días entre el turno asignado \n y el momento de la solicitud, según ausentismo",
+       x = "Turnos",y="Diferencia de días entre el turno asignado y la solicitud",fill = "Presente al turno")+
+  theme_minimal()
+```
+
+### Otras propuestas:
+
+#### Día de la semana del turno
+
+Me interesó conocer si había alguna influencia en el día de la semana del turno asignado, asumiendo que quizás los fines de semana pudieran tener menor ausentismo que los días de semana dada la mayor disponibilidad horaria de las personas.
+
+Sin embargo, aunque los sábados y los domingos sean los días de la semana con mayor cantidad de turnos otorgados, no se ven grandes variaciones en el ausentismo.
+
+```{r Dias semana, echo=FALSE, message=FALSE, warning=FALSE}
+df_clean %>% 
+  mutate(dia_que_se_otorgo = wday(fecha_turno,label=T,locale = Sys.getlocale("LC_TIME"),abbr=F)) %>% 
+  group_by(dia_que_se_otorgo,presente_al_turno) %>% 
+  summarise(n = n(),.groups = "drop") %>% 
+  group_by(dia_que_se_otorgo) %>% 
+  mutate(porc = n/sum(n,na.rm=T),
+         presente_al_turno = factor(presente_al_turno,levels=c("Si","No")),
+         dia_que_se_otorgo = factor(dia_que_se_otorgo,levels=c("lunes","martes","miércoles","jueves","viernes",
+                                                               "sábado","domingo"))) %>% 
+  arrange(dia_que_se_otorgo,presente_al_turno) %>% 
+ggplot() +
+  geom_bar(aes(dia_que_se_otorgo,porc,fill=presente_al_turno),stat="identity",position = "fill") +
+  geom_text(aes(x=dia_que_se_otorgo,y=porc,fill=presente_al_turno,
+                label=paste(round(porc,3)*100,"%","\n (",n,")",sep="")),
+            size=3,stat="identity",position = "fill",vjust=2) +
+  labs(title = "Porcentaje de ausentismo al turno otorgado, \n según día de la semana",
+       x = "",
+       y = "",
+       fill = "Presente al turno",
+       subtitle = "En gris, la población censal por grupo") +
+  theme_minimal()
+  
+```
+
+
+#### Ausentismo por género
+
+Veamos rápidamente la tasa de ausentismo por género:
+
+```{r Ausentismo género, echo=FALSE, message=FALSE, warning=FALSE}
+df %>% 
+  group_by(genero,presente_al_turno) %>% 
+  summarise(n=n_distinct(id_paciente)) %>% 
+  calculate_tabulates(x="genero",y="presente_al_turno",weights="n",add.percentage = "row",affix_sign =T) %>% 
+  rename(`Género / Presente al turno` = 1) %>% 
+  kable(caption = "Ausentismo según género")
+```
+
+No hay diferencias. Pero qué pasa si filtramos por las personas mayores de 18 años?
+Veamos rápidamente la tasa de ausentismo por género:
+
+```{r Ausentismo género mayores, echo=FALSE, message=FALSE, warning=FALSE}
+df %>% 
+  filter(edad >= 18) %>%
+  group_by(genero,presente_al_turno) %>% 
+  summarise(n=n_distinct(id_paciente)) %>% 
+  calculate_tabulates(x="genero",y="presente_al_turno",weights="n",add.percentage = "row",affix_sign =T) %>% 
+  rename(`Género / Presente al turno` = 1) %>% 
+  kable(caption = "Ausentismo según género")
+```
+
+Los varones mayores de 18 años tienden a ausentarse en menor medida.
+
+
+### Conclusiones
+
+* Las personas que residen en el sur de la ciudad y las mujeres tienden a utilizar en mayor medida los centros de salud.
+* La cantidad de turnos otorgados creció en el período estudiado, y disminuyó el ausentismo.
+* Los turnos programados tienden a tener mayor ausentismo que los espontáneos.
+* Mayor distancia entre el día de la solicitud del turno y el turno asignado genera más ausentismo.
+* Hay variabilidad en el ausentismo según el CESAC y el área programática de pertenencia.

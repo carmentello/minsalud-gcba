@@ -1,0 +1,4 @@
+"0","df <- turnos_muestra %>% "
+"0","  left_join(pacientes_muestra,by=""id_paciente"") %>% "
+"0","  left_join(efectores_muestra,by=""id_efector"") %>% "
+"0","  left_join(ap_muestra,by=""id_area_programatica"",suffix=c(""_ef"",""_ap""))"
